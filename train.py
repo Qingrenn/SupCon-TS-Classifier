@@ -6,11 +6,11 @@ import torch.nn.functional as F
 import numpy as np
 import os
 
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
-from dataset import FolderDataset
+from data import FolderDataset
 from model import EncoderForPretraining
 from tqdm import tqdm
 
@@ -19,19 +19,20 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     # Training Configurations
-    data_path: str = '../datasets'
+    train_data_path: str = 'datasets'
+    val_data_path: str = 'test_subdatasets'
     batch_size: int = 128
     max_step: int = 10000
     accumulate_batch_num: int = 1
-    lr: float = 1e-3
-    min_lr: float = 1e-6
+    lr: float = 3e-4
+    min_lr: float = 1e-5
     weight_decay: float = 0.0
     logger: str = 'wandb'
-    output_dir: str = 'output'
+    output_dir: str = 'output_foccon2_only'
     
     # Model Configurations
     encoder_cfg_path: str = '/cpfs02/shared/speechllm/liuzhan/workspace_sci/icefall_general_encoder/egs/general_audio_encoder/mtl/zipformer_audio_encoder/whisper-encoder/whisper-encoder-146M'
-    encoder_ckpt_path: str = None
+    encoder_ckpt_path: str = '/cpfs02/shared/speechllm/liuzhan/workspace_sci/icefall_general_encoder/egs/general_audio_encoder/mtl/zipformer_audio_encoder/exp-ds-xlarge-lr-0.02-full-en-zh-audio-multi-kd-time-mask-ratio-2.0-shar/iter-352000-avg-2.pt'
     feature_dim: int = 1024
     num_classes: int = 4
 
@@ -72,18 +73,34 @@ def init_logger(config):
         logger = LoggerWrapper(logger)
     return logger
 
-def build_dataloader(config, is_ddp=False, rank=0):
-    ds = FolderDataset(config.data_path, transform=None)
-    
-    if is_ddp:
-        # 分布式训练使用DistributedSampler
-        sampler = DistributedSampler(ds, shuffle=True)
+def build_dataloader(config, is_ddp=False, rank=0, mode='train'):
+    if mode == 'train':
+        ds = FolderDataset(config.train_data_path, transform=None)
+    elif mode == 'val':
+        ds = FolderDataset(config.val_data_path, transform=None)
     else:
-        # 单卡训练使用WeightedRandomSampler
+        raise ValueError("Unsupported mode: {}".format(mode))
+    
+    if mode == 'train':
+        # 计算类别权重 - 每个类别被采样到的概率相同
         labels = [entry[1] for entry in ds.samples]
         class_sample_count = np.bincount(labels)
-        weights = 1. / class_sample_count[labels]
-        sampler = WeightedRandomSampler(weights, len(weights))
+        class_weights = len(class_sample_count) / class_sample_count
+        sample_weights = class_weights[labels]
+        
+        if is_ddp:
+            # 分布式训练：先分配数据到各个rank，然后在每个rank内进行类别平衡采样
+            rank_indices = list(range(rank, len(ds), dist.get_world_size()))
+            rank_weights = [sample_weights[i] for i in rank_indices]
+            rank_dataset = Subset(ds, rank_indices)
+            sampler = WeightedRandomSampler(rank_weights, len(rank_weights), replacement=True)
+            ds = rank_dataset  # 更新数据集为当前rank的子集
+        else:
+            # 单卡训练：直接使用类别平衡采样
+            sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
+    else:
+        # 验证集不需要类别平衡采样，直接使用顺序采样
+        sampler = None
 
     def collate_fn(batch):
         waveforms, labels, sub_labels = zip(*[(entry['inputs'], entry['class_idx'], entry['subclass_idx']) for entry in batch])
@@ -106,12 +123,35 @@ def build_dataloader(config, is_ddp=False, rank=0):
         }
 
     dl = DataLoader(ds, batch_size=config.batch_size, collate_fn=collate_fn, sampler=sampler)
+    
     return dl
 
 def create_optimizer_scheduler(model, config):
     optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.max_step, eta_min=config.min_lr)
+
+    # 预热调度器：100步内从0线性增长到目标学习率
+    warmup_scheduler = optim.lr_scheduler.LinearLR(
+        optimizer, 
+        start_factor=0.01,  # 从1%的学习率开始
+        end_factor=1.0,     # 到100%的学习率
+        total_iters=100     # 100步预热
+    )
+
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=config.max_step - 100,  # 剩余步数
+        eta_min=config.min_lr
+    )
+
+    # 组合调度器
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[100]  # 在第100步切换
+    )
+
     return optimizer, scheduler
+
 
 def main():
     # 尝试初始化分布式训练
@@ -136,6 +176,7 @@ def main():
         logger = None
 
     dataloader = build_dataloader(config, is_ddp=is_ddp, rank=local_rank)
+    val_dl = build_dataloader(config, is_ddp=is_ddp, rank=local_rank, mode='val')
     model = EncoderForPretraining(config)
     model.to(device)
     
@@ -156,6 +197,7 @@ def main():
 
         outputs_cache = []
         labels_cache = []
+        sublabels_cache = []
 
         # 只在主进程显示进度条
         pbar = tqdm(dataloader, desc="Training", disable=(is_ddp and local_rank != 0))
@@ -177,22 +219,28 @@ def main():
             
             outputs_cache.append(embeds)
             labels_cache.append(class_idx)
+            sublabels_cache.append(subclass_idx)
 
             if len(outputs_cache) < config.accumulate_batch_num:
                 continue
             
             outputs = torch.cat(outputs_cache, dim=0)
             labels = torch.cat(labels_cache, dim=0)
+            sublabels = torch.cat(sublabels_cache, dim=0)
+            sublabels = labels * 10 + sublabels
 
             # 根据是否使用DDP计算损失
             if is_ddp:
-                con_loss = model.module.cal_loss(outputs, labels, loss_type='supcon')  
+                con_loss = model.module.cal_loss(outputs, labels, loss_type='supcon')
+                con_loss2 = model.module.cal_loss(outputs, sublabels, loss_type='supcon')
                 cla_loss = model.module.cal_loss(outputs, labels, loss_type='classify')
             else:
                 con_loss = model.cal_loss(outputs, labels, loss_type='supcon')
+                con_loss2 = model.cal_loss(outputs, sublabels, loss_type='supcon')
                 cla_loss = model.cal_loss(outputs, labels, loss_type='classify')
             
-            loss = con_loss + cla_loss
+            # loss = cla_loss
+            loss = con_loss + con_loss2
     
             optimizer.zero_grad()
             loss.backward()
@@ -201,19 +249,67 @@ def main():
 
             outputs_cache = []
             labels_cache = []
+            sublabels_cache = []
 
             # 只在主进程记录日志
             if local_rank == 0 and logger is not None:
                 logger.log({
                     "train/loss": loss.item(), 
                     "train/con_loss": con_loss.item(),
-                    "train/cla_loss": cla_loss.item(),
+                    "train/con_loss2": con_loss2.item(),
+                    # "train/cla_loss": cla_loss.item(),
                     "step": step_count, 
                     "train/lr": optimizer.param_groups[0]['lr']
                 })
             
             step_count += 1
-        
+            EvalWhileTraining = False
+            if EvalWhileTraining and local_rank ==0 and step_count % 100 == 0:
+                # evaluate on validation set
+                model.eval()
+                val_outputs = []
+                val_labels = []
+                with torch.no_grad():
+                    for val_batch in tqdm(val_dl, desc="Validating"):
+                        val_inputs = val_batch['inputs'].to(device)
+                        val_class_idx = val_batch['class_idx'].to(device)
+                        val_pad_mask = val_batch['pad_mask'].to(device)
+
+                        if is_ddp:
+                            output = model.module(val_inputs, pad_mask=val_pad_mask)
+                        else:
+                            output = model(val_inputs, pad_mask=val_pad_mask)
+
+                        val_outputs.append(torch.argmax(output['logits'], dim=-1))
+                        val_labels.append(val_class_idx)
+                
+                val_outputs = torch.cat(val_outputs, dim=0)
+                val_labels = torch.cat(val_labels, dim=0)
+                oa = (val_outputs == val_labels).float().mean().item()
+                unique_classes = torch.unique(val_labels)
+                class_oa = {}
+                for cl in unique_classes:
+                    cls_mask = (val_labels == cl)
+                    cls_oa = (val_outputs[cls_mask] == cl).float().mean().item()
+                    class_oa[int(cl.item())] = cls_oa
+                
+                logger.log({
+                    "val/overall_accuracy": oa,
+                    **{f"val/class_{int(cl)}_accuracy": acc for cl, acc in class_oa.items()},
+                    "step": step_count
+                })
+
+            if local_rank ==0 and step_count % 1000 == 0:
+                if not os.path.exists(config.output_dir):
+                    os.makedirs(config.output_dir)
+                save_path = os.path.join(config.output_dir, f'model_{step_count}.pth')
+
+                if is_ddp:
+                    torch.save(model.module.state_dict(), save_path)
+                else:
+                    torch.save(model.state_dict(), save_path)
+
+
         if step_count >= max_step:
             break 
     

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from sklearn import preprocessing
 
 """
 Author: Yonglong Tian (yonglong@mit.edu)
@@ -119,6 +120,108 @@ class ClassificationHead(nn.Module):
         
         if labels is not None:
             loss = F.cross_entropy(logits, labels)
+        else:
+            loss = None
+        
+        return {
+            'logits': logits,
+            'loss': loss
+        }
+
+class FocalSupConHead(nn.Module):
+    def __init__(self, temperature=0.07, base_temperature=0.07, mixup=True):
+        super(FocalSupConHead, self).__init__()
+        self.temperature = temperature
+        self.mixup = mixup
+        self.base_temperature = base_temperature
+
+
+    def forward(self, features, labels=None, mask=None):
+        """
+        Partial codes are based on the implementation of supervised contrastive loss. 
+        import from https https://github.com/HobbitLong/SupContrast.
+        """
+        features = features.squeeze(1)  # (batch, feature_dim)
+        device = (torch.device('cuda')
+                if features.is_cuda
+                else torch.device('cpu'))
+        temperature=0.07
+        base_temperature=0.07
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both `labels` and `mask`')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        elif labels is not None:
+            if self.mixup:
+                if labels.size(1)>1:
+                    weight_index = 10**np.arange(args.num_classes)  
+                    weight_index = torch.tensor(weight_index).unsqueeze(1).to("cuda")
+                    labels_ = labels.mm(weight_index.float()).squeeze(1)
+                    labels_ = labels_.detach().cpu().numpy()
+                    le = preprocessing.LabelEncoder()
+                    le.fit(labels_)
+                    labels = le.transform(labels_)
+                    labels=torch.unsqueeze(torch.tensor(labels),1)
+            labels = labels.contiguous().view(-1, 1) 
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+        
+        anchor_feature = features.float()
+        contrast_feature = features.float()
+        anchor_dot_contrast = torch.div(torch.matmul(anchor_feature, contrast_feature.T),temperature)  
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()  
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),  
+            1,
+            torch.arange(batch_size).view(-1, 1).to(device),
+            0
+        )
+        mask = mask * logits_mask   
+
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask  
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True)) 
+        
+        # compute weight
+        weight = 1-torch.exp(log_prob)
+        
+        # compute mean of log-likelihood over positive
+        mean_log_prob_pos = (weight * mask * log_prob).mean(1)
+
+        # loss
+        mean_log_prob_pos = - (temperature / base_temperature) * mean_log_prob_pos
+        mean_log_prob_pos = mean_log_prob_pos.view(batch_size)
+        
+        N_nonzeor = torch.nonzero(mask.sum(1)).shape[0]
+        loss = mean_log_prob_pos.sum()/N_nonzeor
+        if torch.isnan(loss):
+            print("nan contrastive loss")
+            loss=torch.zeros(1).to(device)          
+        return {
+            'loss': loss,
+        }
+
+
+class FocalLossHead(nn.Module):
+    def __init__(self, hidden_states, num_classes, gamma=2.0, alpha=0.25):
+        super().__init__()
+        self.proj = nn.Linear(hidden_states, num_classes)
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, x, labels=None):
+        logits = self.proj(x)
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        if labels is not None:
+            targets = F.one_hot(labels, num_classes=logits.size(-1)).float()
+            loss = -self.alpha * (1 - torch.exp(log_probs)) ** self.gamma * targets * log_probs
+            loss = loss.sum(dim=-1).mean()
         else:
             loss = None
         

@@ -1,7 +1,7 @@
 from transformers import WhisperConfig
 from .models.whisper_model import CustomWhisperEncoder
 from .models.utils import _to_int_tuple
-from .head import SupConHead, ClassificationHead
+from .head import SupConHead, ClassificationHead, FocalSupConHead, FocalLossHead
 
 import torch
 import torch.nn as nn
@@ -54,8 +54,15 @@ class EncoderForPretraining(nn.Module):
         
         self.downsample = DwonsampleModule(in_channels=1, out_channels=128)  # Assuming input is mono audio
         self.encoder = get_encoder_model(config.encoder_cfg_path, pretrained_ckpt=config.encoder_ckpt_path)
-        self.supcon_head = SupConHead(temperature=0.07, contrast_mode='all', base_temperature=0.07)
-        self.class_head = ClassificationHead(hidden_states=config.feature_dim, num_classes=config.num_classes)
+        # self.supcon_head = SupConHead(temperature=0.07, contrast_mode='all', base_temperature=0.07)
+        self.supcon_head = FocalSupConHead(temperature=0.07, base_temperature=0.07, mixup=False)
+        self.class_head = FocalLossHead(hidden_states=config.feature_dim, num_classes=config.num_classes)
+
+        self.neck = nn.Sequential(
+            nn.Linear(config.feature_dim, 2*config.feature_dim, bias=False),
+            nn.ReLU(),
+            nn.Linear(2*config.feature_dim, config.feature_dim, bias=False)
+        )
 
     def encoder_forward(self, x):
         '''
@@ -90,6 +97,7 @@ class EncoderForPretraining(nn.Module):
     def encode(self, x, pad_mask=None):
         embeddings = self.encoder_forward(x)
         embeddings = self.__aggregate_embeddings__(embeddings, pad_mask)
+        embeddings = self.neck(embeddings)  # (batch, dim)
         embeddings = F.normalize(embeddings, dim=-1, p=2) # L2 Normalize embeddings
         return embeddings
 
@@ -117,13 +125,15 @@ class EncoderForPretraining(nn.Module):
         # pad_mask: (batch, time)
 
         embeddings = self.encode(x, pad_mask)
-        
+        logits = self.class_head(embeddings)['logits']
+
         if labels is not None:
-            loss = self.cal_loss(embeddings, labels)
+            loss = self.cal_loss(embeddings, labels, loss_type='supcon')
         else:
             loss = None
 
         return {
             'embeddings': embeddings,
-            'loss': loss
+            'loss': loss,
+            'logits': logits
         }

@@ -72,7 +72,7 @@ class CustomWhisperEncoder(WhisperPreTrainedModel):
 
         self.conv1 = nn.Conv1d(self.num_mel_bins, self.embed_dim, kernel_size=3, padding=1)
         # self.conv1 = nn.Identity()
-        self.conv2 = nn.Conv1d(self.embed_dim, self.embed_dim, kernel_size=3, stride=2, padding=0)
+        self.conv2 = nn.Conv1d(self.embed_dim, self.embed_dim, kernel_size=3, stride=2, padding=1)
         self.embed_positions = nn.Embedding(self.max_source_positions, self.embed_dim)
 
         # print(f'max_source_positions {self.max_source_positions}')

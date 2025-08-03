@@ -1,7 +1,7 @@
 from transformers import WhisperConfig
 from .models.whisper_model import CustomWhisperEncoder
 from .models.utils import _to_int_tuple
-from .head import SupConHead, ClassificationHead, FocalSupConHead, FocalLossHead
+from .head import SupConHead, ClassificationHead, FocalSupConHead, FocalLossHead, HierarchicalSupConHead
 
 import torch
 import torch.nn as nn
@@ -54,8 +54,7 @@ class EncoderForPretraining(nn.Module):
         
         self.downsample = DwonsampleModule(in_channels=1, out_channels=128)  # Assuming input is mono audio
         self.encoder = get_encoder_model(config.encoder_cfg_path, pretrained_ckpt=config.encoder_ckpt_path)
-        # self.supcon_head = SupConHead(temperature=0.07, contrast_mode='all', base_temperature=0.07)
-        self.supcon_head = FocalSupConHead(temperature=0.07, base_temperature=0.07, mixup=False)
+        self.supcon_head = HierarchicalSupConHead(temperature=0.07, base_temperature=0.07)
         self.class_head = FocalLossHead(hidden_states=config.feature_dim, num_classes=config.num_classes)
 
         self.neck = nn.Sequential(
@@ -101,7 +100,7 @@ class EncoderForPretraining(nn.Module):
         embeddings = F.normalize(embeddings, dim=-1, p=2) # L2 Normalize embeddings
         return embeddings
 
-    def cal_loss(self, embeddings, labels, loss_type='supcon'):
+    def cal_loss(self, embeddings, labels, sublabels, loss_type='supcon'):
         '''
             embeddings: (batch, dim)
             labels: (batch,)
@@ -115,7 +114,7 @@ class EncoderForPretraining(nn.Module):
         if embeddings.dim() == 2:
             embeddings = embeddings.unsqueeze(1)
         
-        loss = self.supcon_head(embeddings, labels)['loss']
+        loss = self.supcon_head(embeddings, labels, sublabels)['loss']
         return loss
 
     def forward(self, x, labels=None, pad_mask=None):
@@ -136,4 +135,78 @@ class EncoderForPretraining(nn.Module):
             'embeddings': embeddings,
             'loss': loss,
             'logits': logits
+        }
+    
+    def cal_loss_with_gathered_features(self, 
+        local_features, gathered_features, gathered_labels, gathered_sublabels, 
+        start_idx, end_idx, loss_type='supcon'):
+        """
+        使用聚合后的特征计算损失，但只对本地样本计算梯度
+        
+        Args:
+            gathered_features: 聚合后的特征 [global_batch_size, feature_dim]
+            gathered_labels: 聚合后的标签 [global_batch_size]
+            gathered_sublabels: 聚合后的子标签 [global_batch_size]
+            start_idx: 本地样本在全局batch中的起始索引
+            end_idx: 本地样本在全局batch中的结束索引
+            loss_type: 损失类型
+        """
+        
+        return self.supcon_head.forward_with_gathered_features(
+            local_features, gathered_features, gathered_labels, gathered_sublabels, start_idx, end_idx,
+        )['loss']
+
+
+class EncoderForClassification(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.encoder = EncoderForPretraining(config)
+
+        self.class_heads = nn.ModuleList()
+        for k, v in config.task2class.items():
+            class_head = FocalLossHead(
+                hidden_states=config.feature_dim, 
+                num_classes=v,
+            )
+            self.class_heads.append(class_head)
+        
+        self.loss_weights = config.loss_weights if hasattr(config, 'loss_weights') else None
+
+    def forward(self, x, task_id, labels=None, pad_mask=None):
+        # x: (batch, time)
+        # task: (batch,)
+        # labels: (batch,)
+        # pad_mask: (batch, time)
+
+        embeddings = self.encoder.encode(x, pad_mask)
+        
+        unique_task_ids = list(set(task_id.cpu().numpy()))
+        task2output = {}
+
+        for id in unique_task_ids:
+            task_mask = (task_id == id)
+            if labels is not None:
+                task_labels = labels[task_mask]
+            else:
+                task_labels = None
+
+            output = self.class_heads[id](x=embeddings[task_mask], labels=task_labels)
+            
+            task2output[id] = {
+                'embeddings': embeddings[task_mask],
+                'logits': output['logits'],
+                'loss': output['loss'],
+            }
+
+        
+        total_loss = []
+        for id, output in task2output.items():
+            weight = self.loss_weights[id] if self.loss_weights else 1.0
+            if output['loss'] is not None:
+                total_loss.append(weight * output['loss'])
+        total_loss = torch.stack(total_loss).mean() if total_loss else None 
+
+        return {
+            'outputs': task2output,
+            'total_loss': total_loss
         }

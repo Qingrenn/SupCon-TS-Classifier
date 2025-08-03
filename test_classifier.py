@@ -10,16 +10,19 @@ import seaborn as sns
 
 from torch.utils.data import DataLoader
 from data import FolderDataset
-from model import EncoderForPretraining
+from model import EncoderForPretraining, EncoderForClassification
 from tqdm import tqdm
-from dataclasses import dataclass
+from dataclasses import dataclass,field
+
+from collections import defaultdict
+
 
 @dataclass
 class TestConfig:
     # Test Configurations
-    test_data_path: str = 'test_datasets'
+    test_data_path: str = 'datasets/test_datasets'
     batch_size: int = 128
-    model_path: str = 'output_foccls_only/model_3000.pth'
+    model_path: str = 'local_checkpoint/class_exp1/model_2000.pth'
     output_dir: str = 'test_results'
     
     # Model Configurations (需要与训练时保持一致)
@@ -27,6 +30,12 @@ class TestConfig:
     encoder_ckpt_path: str = '/cpfs02/shared/speechllm/liuzhan/workspace_sci/icefall_general_encoder/egs/general_audio_encoder/mtl/zipformer_audio_encoder/exp-ds-xlarge-lr-0.02-full-en-zh-audio-multi-kd-time-mask-ratio-2.0-shar/iter-352000-avg-2.pt'
     feature_dim: int = 1024
     num_classes: int = 4
+    task2class: dict = field(default_factory=lambda: {
+        'gw': 2,
+        'leaves': 7,
+        'sleep': 5,
+        'stead': 2
+    })
 
 def build_test_dataloader(config):
     """构建测试数据加载器"""
@@ -57,7 +66,7 @@ def build_test_dataloader(config):
 
 def load_model(config, device):
     """加载训练好的模型"""
-    model = EncoderForPretraining(config)
+    model = EncoderForClassification(config)
     
     # 加载模型权重
     checkpoint = torch.load(config.model_path, map_location=device)
@@ -96,54 +105,64 @@ def extract_features(model, dataloader, device):
 
 def evaluate_classification(model, dataloader, device, class_names=None):
     """评估分类性能"""
-    all_predictions = []
-    all_labels = []
-    all_logits = []
     
+    task2labels = defaultdict(list)
+    task2preds = defaultdict(list)
+
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
             inputs = batch['inputs'].to(device)
             class_idx = batch['class_idx'].to(device)
+            subclass_idx = batch['subclass_idx'].to(device)
             pad_mask = batch['pad_mask'].to(device)
             
             # 获取分类结果
-            output = model(inputs, pad_mask=pad_mask)
-            logits = output['logits']
-            predictions = torch.argmax(logits, dim=-1)
+            task2output = model(inputs, task_id=class_idx, pad_mask=pad_mask)['outputs']
             
-            all_predictions.append(predictions.cpu())
-            all_labels.append(class_idx.cpu())
-            all_logits.append(logits.cpu())
-    
-    all_predictions = torch.cat(all_predictions, dim=0).numpy()
-    all_labels = torch.cat(all_labels, dim=0).numpy()
-    all_logits = torch.cat(all_logits, dim=0).numpy()
-    
+            for task_id, output in task2output.items():
+                logits = output['logits']
+                predictions = torch.argmax(logits, dim=-1)
+                labels = subclass_idx[class_idx == task_id]
+                task2labels[task_id].append(labels.cpu())
+                task2preds[task_id].append(predictions.cpu())
+
+    for k, v in task2labels.items():
+        task2labels[k] = torch.cat(v, dim=0).numpy()
+    for k, v in task2preds.items():
+        task2preds[k] = torch.cat(v, dim=0).numpy()
+
     # 计算准确率
-    accuracy = (all_predictions == all_labels).mean()
-    
+    task2accuracy = {}
+    for k, v in task2preds.items():
+        accuracy = (v == task2labels[k]).mean()
+        task2accuracy[k] = accuracy
+
     # 生成分类报告
-    if class_names is None:
-        class_names = [f'Class_{i}' for i in range(len(np.unique(all_labels)))]
-    
-    report = classification_report(
-        all_labels, all_predictions, 
-        target_names=class_names, 
-        output_dict=True
-    )
-    
-    # 生成混淆矩阵
-    cm = confusion_matrix(all_labels, all_predictions)
+    all_labels = []
+    task2report = {}
+    task2class_names = {}
+    for k, v in task2labels.items():
+        class_names = [f'Class_{i}' for i in range(len(np.unique(v)))]
+        
+        report = classification_report(
+            v, task2preds[k], 
+            target_names=class_names, 
+            output_dict=True
+        )
+        all_labels.extend(v.tolist())
+
+        task2report[k] = report
+        task2class_names[k] = class_names
+
+    all_labels = np.array(all_labels)
     
     return {
-        'accuracy': accuracy,
-        'predictions': all_predictions,
         'labels': all_labels,
-        'logits': all_logits,
-        'classification_report': report,
-        'confusion_matrix': cm,
-        'class_names': class_names
+        'accuracy': task2accuracy,
+        'classification_report': task2report,
+        'class_names': task2class_names
     }
+
 
 def plot_confusion_matrix(cm, class_names, save_path):
     """绘制并保存混淆矩阵"""
@@ -156,6 +175,7 @@ def plot_confusion_matrix(cm, class_names, save_path):
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
+
 
 def plot_feature_distribution(features, labels, class_names, save_path):
     """使用t-SNE可视化特征分布"""
@@ -197,6 +217,7 @@ def plot_feature_distribution(features, labels, class_names, save_path):
     except ImportError:
         print("Warning: sklearn not available, skipping t-SNE visualization")
 
+
 def main():
     # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -235,18 +256,24 @@ def main():
     print("\n" + "="*50)
     print("TEST RESULTS SUMMARY")
     print("="*50)
-    print(f"Overall Accuracy: {results['accuracy']:.4f}")
     print(f"Number of test samples: {len(results['labels'])}")
     print(f"Number of classes: {len(class_names)}")
+
+    for k, v in results['accuracy'].items():
+        print(f"Task ID: {k}, Accuracy: {v:.4f}")
     
     print("\nPer-class Results:")
-    for i, class_name in enumerate(class_names):
-        if class_name in results['classification_report']:
-            precision = results['classification_report'][class_name]['precision']
-            recall = results['classification_report'][class_name]['recall']
-            f1 = results['classification_report'][class_name]['f1-score']
-            support = results['classification_report'][class_name]['support']
-            print(f"  {class_name}: P={precision:.3f}, R={recall:.3f}, F1={f1:.3f}, N={support}")
+
+    for task_id, report in results['classification_report'].items():
+        print(f"\nTask ID: {task_id}")
+        class_names = results['class_names'][task_id]
+        for i, class_name in enumerate(class_names):
+            if class_name in report:
+                precision = report[class_name]['precision']
+                recall = report[class_name]['recall']
+                f1 = report[class_name]['f1-score']
+                support = report[class_name]['support']
+                print(f"  {class_name}: P={precision:.3f}, R={recall:.3f}, F1={f1:.3f}, N={support}")
     
     print(f"\nResults saved to: {config.output_dir}")
     print("Files generated:")

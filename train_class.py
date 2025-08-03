@@ -13,14 +13,14 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.distributed.nn.functional import all_gather
 
 from data import FolderDataset
-from model import EncoderForPretraining
+from model import EncoderForClassification
 from tqdm import tqdm
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-o', '--output_dir', type=str, default='local_checkpoint/output_foccon_only_exp9')
+    parser.add_argument('-o', '--output_dir', type=str, default='local_checkpoint/class_exp2')
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--min_lr', type=float, default=1e-5)
@@ -49,6 +49,12 @@ class Config:
     encoder_ckpt_path: str = '/cpfs02/shared/speechllm/liuzhan/workspace_sci/icefall_general_encoder/egs/general_audio_encoder/mtl/zipformer_audio_encoder/exp-ds-xlarge-lr-0.02-full-en-zh-audio-multi-kd-time-mask-ratio-2.0-shar/iter-352000-avg-2.pt'
     feature_dim: int = 1024
     num_classes: int = 4
+    task2class: dict = field(default_factory=lambda: {
+        'gw': 2,
+        'leaves': 7,
+        'sleep': 5,
+        'stead': 2
+    })
 
     def update(self, updates_dict):
         """更新配置参数"""
@@ -104,6 +110,9 @@ def build_dataloader(config, is_ddp=False, rank=0, mode='train'):
     else:
         raise ValueError("Unsupported mode: {}".format(mode))
     
+    print('Class index:', ds.class_to_idx)
+    print('Sub-class index:', ds.subclass_to_idx)
+    
     if mode == 'train':
         # 计算类别权重 - 每个类别被采样到的概率相同
         labels = [entry[1]*10 + entry[2] for entry in ds.samples]
@@ -156,7 +165,12 @@ def build_dataloader(config, is_ddp=False, rank=0, mode='train'):
     return dl
 
 def create_optimizer_scheduler(model, config):
-    optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    if is_distributed():
+        # optimizer = optim.AdamW(model.module.class_heads.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        optimizer = optim.AdamW(model.module.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    else:
+        # optimizer = optim.AdamW(model.class_heads.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        optimizer = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
 
     # 预热调度器：100步内从0线性增长到目标学习率
     warmup_step = int(config.max_step * 0.01)
@@ -181,6 +195,15 @@ def create_optimizer_scheduler(model, config):
     )
 
     return optimizer, scheduler
+
+
+def preprocess_ckpt(ckpt):
+    new_ckpt = {}
+    for k, v in ckpt.items():
+        if k.startswith('class_head'):
+            continue
+        new_ckpt['encoder.' + k] = v
+    return new_ckpt
 
 
 def main():
@@ -209,10 +232,13 @@ def main():
 
     dataloader = build_dataloader(config, is_ddp=is_ddp, rank=local_rank)
     val_dl = build_dataloader(config, is_ddp=is_ddp, rank=local_rank, mode='val')
-    model = EncoderForPretraining(config)
+    model = EncoderForClassification(config)
     if config.resume:
         if os.path.isfile(config.resume):
-            model.load_state_dict(torch.load(config.resume))
+            ckpt = torch.load(config.resume)
+            ckpt = preprocess_ckpt(ckpt)
+            outputs = model.load_state_dict(ckpt, strict=False)
+            print(f"Resuming from checkpoint: {config.resume}, missing keys: {outputs.missing_keys}")
     model.to(device)
     
     # 根据是否分布式训练包装模型
@@ -245,63 +271,26 @@ def main():
             class_idx = batch['class_idx'].to(device)
             subclass_idx = batch['subclass_idx'].to(device)
             pad_mask = batch['pad_mask'].to(device)
-            
-            # 根据是否使用DDP调用模型
-            if is_ddp:
-                embeds = model.module.encode(inputs, pad_mask)
-            else:
-                embeds = model.encode(inputs, pad_mask)
-            
-            outputs_cache.append(embeds)
-            labels_cache.append(class_idx)
-            sublabels_cache.append(subclass_idx)
-            
-            outputs = torch.cat(outputs_cache, dim=0)
-            labels = torch.cat(labels_cache, dim=0)
-            sublabels = torch.cat(sublabels_cache, dim=0)
-            # sublabels = labels * 10 + sublabels
 
             # 根据是否使用DDP计算损失
             if is_ddp:
-                local_batch_size = outputs.shape[0]
-
-                all_outputs = all_gather(outputs)
-                all_outputs = torch.cat(all_outputs, dim=0)
-                all_labels = all_gather(labels)
-                all_labels = torch.cat(all_labels, dim=0)
-                all_sublabels = all_gather(sublabels)
-                all_sublabels = torch.cat(all_sublabels, dim=0)
-                
-                rank = dist.get_rank()
-                world_size = dist.get_world_size()
-                start_idx = rank * local_batch_size
-                end_idx = start_idx + local_batch_size
-                local_outputs = all_outputs[start_idx:end_idx]
-
-                con_loss = model.module.cal_loss_with_gathered_features(
-                    local_outputs, all_outputs, all_labels, all_sublabels, start_idx, end_idx, loss_type='supcon'
-                )
+                output = model.module(inputs, task_id=class_idx, labels=subclass_idx, pad_mask=pad_mask)
             else:
-                con_loss = model.cal_loss(outputs, labels, sublabels, loss_type='supcon')
-            
-            loss = con_loss
-    
+                output = model(inputs,  task_id=class_idx, labels=subclass_idx, pad_mask=pad_mask)
+
+            loss = output['total_loss']
+            task2loss = {f'train/{id}_loss': task_output['loss'].item() for id, task_output in output['outputs'].items()}
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             scheduler.step()
 
-            outputs_cache = []
-            labels_cache = []
-            sublabels_cache = []
-
             # 只在主进程记录日志
             if local_rank == 0 and logger is not None:
                 logger.log({
                     "train/loss": loss.item(), 
-                    "train/con_loss": con_loss.item(),
-                    # "train/con_loss2": con_loss2.item(),
-                    # "train/cla_loss": cla_loss.item(),
+                    **task2loss,
                     "step": step_count, 
                     "train/lr": optimizer.param_groups[0]['lr']
                 })

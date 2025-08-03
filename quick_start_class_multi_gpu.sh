@@ -23,4 +23,4 @@ echo "[√] 已切换工作目录到 `pwd`"
 PYTHON="/root/miniconda3/envs/icefall/bin/python"
 echo "[√] 使用 Python 路径: $PYTHON"
 
-"$PYTHON" -m torch.distributed.run --nproc_per_node=8 train.py
+"$PYTHON" -m torch.distributed.run --nproc_per_node=8 train_class.py --resume local_checkpoint/output_foccon_only_exp9/model_final.pth

@@ -229,3 +229,208 @@ class FocalLossHead(nn.Module):
             'logits': logits,
             'loss': loss
         }
+
+
+class HierarchicalSupConHead(nn.Module):
+    def __init__(self, temperature=0.07, base_temperature=0.07, 
+                 label_weight=0.1, sublabel_weight=1.0):
+        super(HierarchicalSupConHead, self).__init__()
+        self.temperature = temperature
+        self.base_temperature = base_temperature
+        self.label_weight = label_weight
+        self.sublabel_weight = sublabel_weight
+
+    def forward(self, features, labels=None, sublabels=None, mask=None):
+        """
+        带权重的两级分类对比学习
+        
+        Args:
+            features: 特征向量 [batch_size, feature_dim]
+            labels: 主标签 [batch_size]
+            sublabels: 子标签 [batch_size] 
+            mask: 可选的对比掩码
+        """
+        if len(features.shape) == 3:
+            features = features.squeeze(1)
+            
+        device = features.device
+        batch_size = features.shape[0]
+        
+        if labels is None or sublabels is None:
+            raise ValueError('Both labels and sublabels are required')
+        
+        # 确保标签格式正确
+        labels = labels.contiguous().view(-1, 1)
+        sublabels = sublabels.contiguous().view(-1, 1)
+        
+        # 创建掩码
+        label_mask = torch.eq(labels, labels.T).float().to(device)
+        sublabel_mask = torch.eq(sublabels, sublabels.T).float().to(device)
+        # 子标签对比只在相同主标签内进行
+        sublabel_mask = sublabel_mask * label_mask
+        
+        # 计算相似度
+        anchor_dot_contrast = torch.div(
+            torch.matmul(features, features.T), 
+            self.temperature
+        )
+        
+        # 数值稳定性
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+        
+        # 排除自对比
+        logits_mask = torch.scatter(
+            torch.ones_like(label_mask),
+            1,
+            torch.arange(batch_size).view(-1, 1).to(device),
+            0
+        )
+        
+        # 计算概率
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        weight = 1 - torch.exp(log_prob)
+        
+        # 主标签损失
+        label_contrastive_mask = label_mask * logits_mask
+        label_pos_pairs = label_contrastive_mask.sum(1)
+        label_pos_pairs = torch.where(label_pos_pairs < 1e-6, 1, label_pos_pairs)
+        mean_log_prob_pos_label = (weight * label_contrastive_mask * log_prob).sum(1) / label_pos_pairs
+        label_loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos_label
+        
+        # 子标签损失
+        sublabel_contrastive_mask = sublabel_mask * logits_mask  
+        sublabel_pos_pairs = sublabel_contrastive_mask.sum(1)
+        sublabel_pos_pairs = torch.where(sublabel_pos_pairs < 1e-6, 1, sublabel_pos_pairs)
+        mean_log_prob_pos_sublabel = (weight * sublabel_contrastive_mask * log_prob).sum(1) / sublabel_pos_pairs
+        sublabel_loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos_sublabel
+        
+        # 平均损失
+        valid_label_samples = (label_contrastive_mask.sum(1) > 0).float()
+        valid_sublabel_samples = (sublabel_contrastive_mask.sum(1) > 0).float()
+        
+        if valid_label_samples.sum() > 0:
+            label_loss = (label_loss * valid_label_samples).sum() / valid_label_samples.sum()
+        else:
+            label_loss = features.sum() * 0.0  # 返回一个零张量
+            
+        if valid_sublabel_samples.sum() > 0:
+            sublabel_loss = (sublabel_loss * valid_sublabel_samples).sum() / valid_sublabel_samples.sum()
+        else:
+            sublabel_loss = features.sum() * 0.0
+        
+        # 处理NaN
+        if torch.isnan(label_loss):
+            label_loss = features.sum() * 0.0
+        if torch.isnan(sublabel_loss):
+            sublabel_loss = features.sum() * 0.0
+        
+        # 加权组合
+        total_loss = (self.label_weight * label_loss + 
+                      self.sublabel_weight * sublabel_loss)
+        
+        return {
+            'loss': total_loss,
+        }
+    
+    def forward_with_gathered_features(
+        self, 
+        local_features,
+        gathered_features, 
+        gathered_labels, 
+        gathered_sublabels, 
+        start_idx, 
+        end_idx
+    ):
+        """
+        使用聚合特征的层次化监督对比学习
+        """
+
+        if len(gathered_features.shape) == 3:
+            gathered_features = gathered_features.squeeze(1)
+            
+        device = gathered_features.device
+        
+        # 提取本地特征（保持梯度）
+        local_labels = gathered_labels[start_idx:end_idx]
+        local_sublabels = gathered_sublabels[start_idx:end_idx]
+        
+        batch_size = local_features.shape[0]
+        global_batch_size = gathered_features.shape[0]
+        
+        # 确保标签格式正确
+        local_labels = local_labels.contiguous().view(-1, 1)
+        local_sublabels = local_sublabels.contiguous().view(-1, 1)
+        gathered_labels = gathered_labels.contiguous().view(-1, 1)
+        gathered_sublabels = gathered_sublabels.contiguous().view(-1, 1)
+        
+        # 创建掩码
+        label_mask = torch.eq(local_labels, gathered_labels.T).float().to(device)
+        sublabel_mask = torch.eq(local_sublabels, gathered_sublabels.T).float().to(device)
+        # 子标签对比只在相同主标签内进行
+        sublabel_mask = sublabel_mask * label_mask
+        
+        # 计算相似度：local_features @ gathered_features.T
+        anchor_dot_contrast = torch.div(
+            torch.matmul(local_features, gathered_features.T), 
+            self.temperature
+        )
+        
+        # 数值稳定性
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+        
+        # 排除自对比 - 创建logits_mask
+        logits_mask = torch.ones(batch_size, global_batch_size, device=device)
+        for i in range(batch_size):
+            global_idx = start_idx + i
+            if global_idx < global_batch_size:
+                logits_mask[i, global_idx] = 0
+        
+        # 计算概率和权重
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        weight = 1 - torch.exp(log_prob)  # 与forward方法一致的权重计算
+        
+        # 主标签损失
+        label_contrastive_mask = label_mask * logits_mask
+        label_pos_pairs = label_contrastive_mask.sum(1)
+        label_pos_pairs = torch.where(label_pos_pairs < 1e-6, 1, label_pos_pairs)
+        mean_log_prob_pos_label = (weight * label_contrastive_mask * log_prob).sum(1) / label_pos_pairs
+        label_loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos_label
+        
+        # 子标签损失
+        sublabel_contrastive_mask = sublabel_mask * logits_mask  
+        sublabel_pos_pairs = sublabel_contrastive_mask.sum(1)
+        sublabel_pos_pairs = torch.where(sublabel_pos_pairs < 1e-6, 1, sublabel_pos_pairs)
+        mean_log_prob_pos_sublabel = (weight * sublabel_contrastive_mask * log_prob).sum(1) / sublabel_pos_pairs
+        sublabel_loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos_sublabel
+        
+        # 平均损失 - 与forward方法一致
+        valid_label_samples = (label_contrastive_mask.sum(1) > 0).float()
+        valid_sublabel_samples = (sublabel_contrastive_mask.sum(1) > 0).float()
+        
+        if valid_label_samples.sum() > 0:
+            label_loss = (label_loss * valid_label_samples).sum() / valid_label_samples.sum()
+        else:
+            label_loss = local_features.sum() * 0
+            
+        if valid_sublabel_samples.sum() > 0:
+            sublabel_loss = (sublabel_loss * valid_sublabel_samples).sum() / valid_sublabel_samples.sum()
+        else:
+            sublabel_loss = local_features.sum() * 0
+        
+        # 处理NaN
+        if torch.isnan(label_loss):
+            label_loss = local_features.sum() * 0
+        if torch.isnan(sublabel_loss):
+            sublabel_loss = local_features.sum() * 0
+        
+        # 加权组合 - 与forward方法一致
+        total_loss = (self.label_weight * label_loss + 
+                    self.sublabel_weight * sublabel_loss)
+        
+        return {
+            'loss': total_loss,
+        }

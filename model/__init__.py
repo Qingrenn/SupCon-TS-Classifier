@@ -1,1 +1,1 @@
-from .model import EncoderForPretraining
+from .model import EncoderForPretraining, EncoderForClassification
